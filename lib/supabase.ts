@@ -25,11 +25,11 @@ export async function getConversationHistory(
     .from("messages")
     .select("role, content")
     .eq("phone_number", phoneNumber)
-    .order("created_at", { ascending: true })
+    .order("created_at", { ascending: false })
     .limit(HISTORY_LIMIT);
 
   if (error) throw error;
-  return data ?? [];
+  return (data ?? []).reverse();
 }
 
 export async function appendMessage(

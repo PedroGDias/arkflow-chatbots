@@ -26,12 +26,21 @@ export async function GET(request: NextRequest) {
   return new NextResponse(challenge, { status: 200 });
 }
 
+function isAllowedSender(phoneNumber: string): boolean {
+  const allowList = (process.env.ALLOWED_PHONE_NUMBERS ?? "")
+    .split(",")
+    .map((n) => n.trim())
+    .filter(Boolean);
+  return allowList.includes(phoneNumber);
+}
+
 // Meta calls this for every inbound message/status update.
 export async function POST(request: NextRequest) {
   const payload = await request.json();
   const messages = extractIncomingMessages(payload);
 
   for (const message of messages) {
+    if (!isAllowedSender(message.from)) continue;
     await handleIncomingMessage(message);
   }
 
