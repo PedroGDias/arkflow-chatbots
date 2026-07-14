@@ -19,6 +19,26 @@ function clientId(): number {
   return Number(env("ARKFLOW_CLIENT_ID"));
 }
 
+// The catalog's category grouping is fixed (7 categories). service_tariffs stores the
+// slug in its `category` column; this is the single source of truth for display name + type.
+export const CATEGORIES: Array<{ slug: string; name: string; type: "product" | "service" }> = [
+  { slug: "food", name: "Food", type: "product" },
+  { slug: "sports_equipment", name: "Sports Equipment", type: "product" },
+  { slug: "musical_instruments", name: "Musical Instruments", type: "product" },
+  { slug: "home_equipment", name: "Home & Furniture", type: "product" },
+  { slug: "bus_rental", name: "Bus Rental", type: "service" },
+  { slug: "tech_development", name: "Tech Development", type: "service" },
+  { slug: "business_consulting", name: "Business Consulting", type: "service" },
+];
+
+function categoryName(slug: string | null): string {
+  return CATEGORIES.find((c) => c.slug === slug)?.name ?? "Other";
+}
+
+function categoryType(slug: string | null): "product" | "service" {
+  return CATEGORIES.find((c) => c.slug === slug)?.type ?? "product";
+}
+
 export interface CatalogItem {
   id: number;
   name: string;
@@ -30,92 +50,67 @@ export interface CatalogItem {
   category_type: "product" | "service";
 }
 
+function toCatalogItem(row: any): CatalogItem {
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    price: Number(row.base_price),
+    currency: row.currency,
+    unit: row.unit,
+    category: categoryName(row.category),
+    category_type: categoryType(row.category),
+  };
+}
+
 export async function searchCatalog(
   query: string,
   type?: "product" | "service"
 ): Promise<CatalogItem[]> {
   const supabase = getErpClient();
-  let request = supabase
-    .from("catalog_items")
-    .select("id, name, description, price, currency, unit, categories(name, type)")
+  const { data, error } = await supabase
+    .from("service_tariffs")
+    .select("id, name, description, base_price, currency, unit, category")
     .eq("client_id", clientId())
     .eq("active", true)
     .or(`name.ilike.%${query}%,description.ilike.%${query}%`)
     .limit(10);
 
-  if (type) {
-    request = request.eq("categories.type", type);
-  }
-
-  const { data, error } = await request;
   if (error) throw error;
-
-  return (data ?? [])
-    .filter((row: any) => row.categories)
-    .map((row: any) => ({
-      id: row.id,
-      name: row.name,
-      description: row.description,
-      price: row.price,
-      currency: row.currency,
-      unit: row.unit,
-      category: row.categories.name,
-      category_type: row.categories.type,
-    }));
+  let items: CatalogItem[] = (data ?? []).map(toCatalogItem);
+  if (type) items = items.filter((i: CatalogItem) => i.category_type === type);
+  return items;
 }
 
 export async function listItemsByCategory(categorySlug: string): Promise<CatalogItem[]> {
   const supabase = getErpClient();
   const { data, error } = await supabase
-    .from("catalog_items")
-    .select("id, name, description, price, currency, unit, categories!inner(name, type, slug)")
+    .from("service_tariffs")
+    .select("id, name, description, base_price, currency, unit, category")
     .eq("client_id", clientId())
     .eq("active", true)
-    .eq("categories.slug", categorySlug)
+    .eq("category", categorySlug)
     .limit(10);
 
   if (error) throw error;
-
-  return (data ?? []).map((row: any) => ({
-    id: row.id,
-    name: row.name,
-    description: row.description,
-    price: row.price,
-    currency: row.currency,
-    unit: row.unit,
-    category: row.categories.name,
-    category_type: row.categories.type,
-  }));
+  return (data ?? []).map(toCatalogItem);
 }
 
 export async function listCategories(): Promise<{ slug: string; name: string; type: string }[]> {
-  const supabase = getErpClient();
-  const { data, error } = await supabase.from("categories").select("slug, name, type");
-  if (error) throw error;
-  return data ?? [];
+  return CATEGORIES;
 }
 
 export async function getItemDetails(itemId: number): Promise<CatalogItem | null> {
   const supabase = getErpClient();
   const { data, error } = await supabase
-    .from("catalog_items")
-    .select("id, name, description, price, currency, unit, categories(name, type)")
+    .from("service_tariffs")
+    .select("id, name, description, base_price, currency, unit, category")
     .eq("id", itemId)
     .eq("client_id", clientId())
     .single();
 
   if (error) return null;
-  const row = data as any;
-  return {
-    id: row.id,
-    name: row.name,
-    description: row.description,
-    price: row.price,
-    currency: row.currency,
-    unit: row.unit,
-    category: row.categories.name,
-    category_type: row.categories.type,
-  };
+  return toCatalogItem(data);
 }
 
 export async function findOrCreateCustomer(phoneNumber: string): Promise<number> {
@@ -155,47 +150,32 @@ export async function updateCustomerInfo(
   if (error) throw error;
 }
 
-async function getOrCreateDraftOrder(customerId: number): Promise<number> {
+// An "order" in this ERP is a quote (source='whatsapp') with quote_services line items.
+// The quote's subtotal/tax/total are recomputed by a DB trigger whenever lines change.
+async function getOrCreateDraftQuote(customerId: number): Promise<number> {
   const supabase = getErpClient();
 
   const { data: existing, error: findError } = await supabase
-    .from("orders")
+    .from("quotes")
     .select("id")
     .eq("client_id", clientId())
     .eq("customer_id", customerId)
     .eq("status", "draft")
+    .order("created_at", { ascending: false })
+    .limit(1)
     .maybeSingle();
 
   if (findError) throw findError;
   if (existing) return existing.id as number;
 
   const { data: created, error: createError } = await supabase
-    .from("orders")
-    .insert({ client_id: clientId(), customer_id: customerId, status: "draft" })
+    .from("quotes")
+    .insert({ client_id: clientId(), customer_id: customerId, source: "whatsapp", status: "draft" })
     .select("id")
     .single();
 
   if (createError) throw createError;
   return created.id as number;
-}
-
-async function recalculateOrderTotal(orderId: number): Promise<number> {
-  const supabase = getErpClient();
-  const { data, error } = await supabase
-    .from("order_items")
-    .select("line_total")
-    .eq("order_id", orderId);
-
-  if (error) throw error;
-  const total = (data ?? []).reduce((sum: number, row: any) => sum + Number(row.line_total), 0);
-
-  const { error: updateError } = await supabase
-    .from("orders")
-    .update({ total, updated_at: new Date().toISOString() })
-    .eq("id", orderId);
-
-  if (updateError) throw updateError;
-  return total;
 }
 
 export interface OrderView {
@@ -206,31 +186,32 @@ export interface OrderView {
   items: Array<{ item_id: number; name: string; quantity: number; unit_price: number; line_total: number }>;
 }
 
-async function loadOrder(orderId: number): Promise<OrderView> {
+async function loadQuote(quoteId: number): Promise<OrderView> {
   const supabase = getErpClient();
 
-  const { data: order, error: orderError } = await supabase
-    .from("orders")
+  const { data: quote, error: qErr } = await supabase
+    .from("quotes")
     .select("id, status, currency, total")
-    .eq("id", orderId)
+    .eq("id", quoteId)
     .single();
-  if (orderError) throw orderError;
+  if (qErr) throw qErr;
 
-  const { data: items, error: itemsError } = await supabase
-    .from("order_items")
-    .select("catalog_item_id, quantity, unit_price, line_total, catalog_items(name)")
-    .eq("order_id", orderId);
-  if (itemsError) throw itemsError;
+  const { data: lines, error: lErr } = await supabase
+    .from("quote_services")
+    .select("tariff_id, itinerary, qty, unit_price, line_total")
+    .eq("quote_id", quoteId)
+    .order("sort_order", { ascending: true });
+  if (lErr) throw lErr;
 
   return {
-    orderId: order.id as number,
-    status: order.status as string,
-    currency: order.currency as string,
-    total: Number(order.total),
-    items: (items ?? []).map((row: any) => ({
-      item_id: row.catalog_item_id,
-      name: row.catalog_items?.name ?? "Unknown item",
-      quantity: row.quantity,
+    orderId: quote.id as number,
+    status: quote.status as string,
+    currency: quote.currency as string,
+    total: Number(quote.total),
+    items: (lines ?? []).map((row: any) => ({
+      item_id: row.tariff_id,
+      name: row.itinerary ?? "Item",
+      quantity: Number(row.qty),
       unit_price: Number(row.unit_price),
       line_total: Number(row.line_total),
     })),
@@ -246,62 +227,86 @@ export async function addItemToOrder(
   const item = await getItemDetails(itemId);
   if (!item) throw new Error(`Catalog item ${itemId} not found`);
 
-  const orderId = await getOrCreateDraftOrder(customerId);
+  const quoteId = await getOrCreateDraftQuote(customerId);
 
   const { data: existing, error: findError } = await supabase
-    .from("order_items")
-    .select("id, quantity")
-    .eq("order_id", orderId)
-    .eq("catalog_item_id", itemId)
+    .from("quote_services")
+    .select("id, qty")
+    .eq("quote_id", quoteId)
+    .eq("tariff_id", itemId)
     .maybeSingle();
   if (findError) throw findError;
 
   if (existing) {
     const { error } = await supabase
-      .from("order_items")
-      .update({ quantity: existing.quantity + quantity })
+      .from("quote_services")
+      .update({ qty: Number(existing.qty) + quantity })
       .eq("id", existing.id);
     if (error) throw error;
   } else {
-    const { error } = await supabase
-      .from("order_items")
-      .insert({ order_id: orderId, catalog_item_id: itemId, quantity, unit_price: item.price });
+    const { error } = await supabase.from("quote_services").insert({
+      client_id: clientId(),
+      quote_id: quoteId,
+      tariff_id: itemId,
+      itinerary: item.name, // product name — surfaced in the Orders drawer
+      qty: quantity,
+      unit_price: item.price,
+    });
     if (error) throw error;
   }
 
-  await recalculateOrderTotal(orderId);
-  return loadOrder(orderId);
+  // quote totals are recalculated by the quote_services_recalc trigger.
+  return loadQuote(quoteId);
 }
 
 export async function removeItemFromOrder(customerId: number, itemId: number): Promise<OrderView> {
   const supabase = getErpClient();
-  const orderId = await getOrCreateDraftOrder(customerId);
+  const quoteId = await getOrCreateDraftQuote(customerId);
 
   const { error } = await supabase
-    .from("order_items")
+    .from("quote_services")
     .delete()
-    .eq("order_id", orderId)
-    .eq("catalog_item_id", itemId);
+    .eq("quote_id", quoteId)
+    .eq("tariff_id", itemId);
   if (error) throw error;
 
-  await recalculateOrderTotal(orderId);
-  return loadOrder(orderId);
+  return loadQuote(quoteId);
 }
 
 export async function viewOrder(customerId: number): Promise<OrderView> {
-  const orderId = await getOrCreateDraftOrder(customerId);
-  return loadOrder(orderId);
+  const quoteId = await getOrCreateDraftQuote(customerId);
+  return loadQuote(quoteId);
 }
 
 export async function confirmOrder(customerId: number): Promise<OrderView> {
   const supabase = getErpClient();
-  const orderId = await getOrCreateDraftOrder(customerId);
+  const quoteId = await getOrCreateDraftQuote(customerId);
 
   const { error } = await supabase
-    .from("orders")
-    .update({ status: "confirmed", updated_at: new Date().toISOString() })
-    .eq("id", orderId);
+    .from("quotes")
+    .update({ status: "accepted", updated_at: new Date().toISOString() })
+    .eq("id", quoteId);
   if (error) throw error;
 
-  return loadOrder(orderId);
+  return loadQuote(quoteId);
+}
+
+// Per-interaction telemetry row, mirroring Avicsa's WhatsApp bot (automation 19):
+// one run per handled message, response_time in whole seconds, customer = phone.
+export async function logRun(params: {
+  customer: string;
+  respondingTo: string;
+  responseTimeSec: number;
+  success: boolean;
+}): Promise<void> {
+  const supabase = getErpClient();
+  const automationId = Number(env("ARKFLOW_AUTOMATION_ID"));
+  const { error } = await supabase.from("runs").insert({
+    automation_id: automationId,
+    response_time: Math.max(0, Math.round(params.responseTimeSec)),
+    status: params.success ? "success" : "fail",
+    customer: params.customer,
+    responding_to: `WA: "${params.respondingTo}"`,
+  });
+  if (error) throw error;
 }

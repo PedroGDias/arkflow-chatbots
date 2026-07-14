@@ -9,7 +9,7 @@ import {
 import { appendMessage, getConversationHistory } from "@/lib/supabase";
 import { getAssistantReply } from "@/lib/claude";
 import { transcribeAudio } from "@/lib/transcribe";
-import { findOrCreateCustomer } from "@/lib/erp";
+import { findOrCreateCustomer, logRun } from "@/lib/erp";
 
 // Meta calls this once when you register/verify the webhook URL.
 export async function GET(request: NextRequest) {
@@ -64,25 +64,45 @@ function describeInteractiveTap(message: IncomingMessage & { kind: "interactive"
 
 async function handleIncomingMessage(message: IncomingMessage): Promise<void> {
   const from = message.from;
+  const startedAt = Date.now();
 
   let text: string;
+  let respondingTo: string; // human-facing inbound content, for the runs telemetry row
   if (message.kind === "audio") {
     text = await transcribeAudio(await downloadMedia(message.mediaId));
+    respondingTo = text;
   } else if (message.kind === "interactive") {
     text = describeInteractiveTap(message);
+    respondingTo = message.replyTitle;
   } else {
     text = message.text;
+    respondingTo = message.text;
   }
 
-  const [customerId, history] = await Promise.all([
-    findOrCreateCustomer(from),
-    getConversationHistory(from),
-  ]);
-  const reply = await getAssistantReply(history, text, { phoneNumber: from, customerId });
+  // Run status reflects whether we produced a reply — not whether the outbound
+  // WhatsApp send succeeded — so logRun fires exactly once per message.
+  let reply: string;
+  try {
+    const [customerId, history] = await Promise.all([
+      findOrCreateCustomer(from),
+      getConversationHistory(from),
+    ]);
+    reply = await getAssistantReply(history, text, { phoneNumber: from, customerId });
+  } catch (err) {
+    await logRun({
+      customer: from,
+      respondingTo,
+      responseTimeSec: (Date.now() - startedAt) / 1000,
+      success: false,
+    });
+    throw err;
+  }
 
-  const writes = [
+  const elapsedSec = (Date.now() - startedAt) / 1000;
+  const writes: Promise<unknown>[] = [
     appendMessage(from, { role: "user", content: text }),
     appendMessage(from, { role: "assistant", content: reply || "[menu shown to user]" }),
+    logRun({ customer: from, respondingTo, responseTimeSec: elapsedSec, success: true }),
   ];
   if (reply) writes.push(sendWhatsAppMessage(from, reply));
 
