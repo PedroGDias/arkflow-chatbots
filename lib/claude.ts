@@ -5,6 +5,7 @@ import {
   confirmOrder,
   getItemDetails,
   listCategories,
+  listItemsByCategory,
   removeItemFromOrder,
   searchCatalog,
   updateCustomerInfo,
@@ -18,8 +19,11 @@ const SYSTEM_PROMPT = `You are the Arkflow Ordering Assistant on WhatsApp. Arkfl
 Your job: figure out what the user is looking for from what they say (they may type or send a voice note, which arrives already transcribed), help them find the right item(s), build up an order, and confirm it when they're ready.
 
 Guidelines:
+- Always reply in the same language the user is writing in (detect it from their message; if a voice note transcript is in Portuguese, reply in Portuguese, etc.). This includes text you pass into show_main_menu/show_category_menu.
 - If the user's intent is unclear or they just say hi, call show_main_menu to present Products vs Services as buttons rather than guessing.
-- If they pick a broad category, call show_category_menu to list items in it rather than describing every item in text.
+- If they pick a broad category (product or service type), call show_category_menu to present the specific categories as a list rather than describing every item in text.
+- If the user just tapped a specific category from that list, call list_items_in_category with its slug and present the results conversationally.
+- show_main_menu and show_category_menu send the ONLY message for that turn — their body_text IS your reply. Never send additional text alongside or after them.
 - If they describe what they want in free text (typed or from a voice note), call search_catalog directly.
 - When they want to add something, call add_item_to_order. Confirm quantities with the user if ambiguous.
 - Before finalizing, call view_order and read the summary back to the user for confirmation.
@@ -50,18 +54,56 @@ interface ToolContext {
 const TOOLS: Anthropic.Tool[] = [
   {
     name: "show_main_menu",
-    description: "Send the user a button menu to choose between Products and Services.",
-    input_schema: { type: "object", properties: {} },
+    description:
+      "Send the user a button menu to choose between Products and Services. This message IS your reply — do not send additional text alongside it.",
+    input_schema: {
+      type: "object",
+      properties: {
+        body_text: {
+          type: "string",
+          description:
+            "Short prompt shown above the buttons (e.g. \"What are you looking for today?\"), written in the same language the user has been writing in.",
+        },
+        products_label: {
+          type: "string",
+          description: "Button label for the products option, max 20 characters, in the user's language.",
+        },
+        services_label: {
+          type: "string",
+          description: "Button label for the services option, max 20 characters, in the user's language.",
+        },
+      },
+      required: ["body_text", "products_label", "services_label"],
+    },
   },
   {
     name: "show_category_menu",
-    description: "Send the user a list menu of categories for either products or services.",
+    description:
+      "Send the user a list menu of categories for either products or services. This message IS your reply — do not send additional text alongside it.",
     input_schema: {
       type: "object",
       properties: {
         type: { type: "string", enum: ["product", "service"] },
+        body_text: {
+          type: "string",
+          description:
+            "Short prompt shown above the list (e.g. \"Which kind of product?\"), written in the same language the user has been writing in.",
+        },
+        button_text: {
+          type: "string",
+          description: "Label for the button that opens the list, max 20 characters, in the user's language.",
+        },
       },
-      required: ["type"],
+      required: ["type", "body_text", "button_text"],
+    },
+  },
+  {
+    name: "list_items_in_category",
+    description: "List all items in one specific category by its slug (use after the user taps a category from a menu).",
+    input_schema: {
+      type: "object",
+      properties: { category_slug: { type: "string" } },
+      required: ["category_slug"],
     },
   },
   {
@@ -132,26 +174,25 @@ const TOOLS: Anthropic.Tool[] = [
 async function executeTool(name: string, input: any, ctx: ToolContext): Promise<string> {
   switch (name) {
     case "show_main_menu": {
-      await sendInteractiveButtons(ctx.phoneNumber, "What are you looking for today?", [
-        { id: "menu_products", title: "Products" },
-        { id: "menu_services", title: "Services" },
+      await sendInteractiveButtons(ctx.phoneNumber, input.body_text, [
+        { id: "menu_products", title: input.products_label },
+        { id: "menu_services", title: input.services_label },
       ]);
       return "Main menu sent to the user.";
     }
     case "show_category_menu": {
       const categories = (await listCategories()).filter((c) => c.type === input.type);
-      await sendListMessage(
-        ctx.phoneNumber,
-        input.type === "product" ? "Which kind of product?" : "Which service?",
-        "Browse",
-        [
-          {
-            title: input.type === "product" ? "Products" : "Services",
-            rows: categories.map((c) => ({ id: `cat_${c.slug}`, title: c.name })),
-          },
-        ]
-      );
+      await sendListMessage(ctx.phoneNumber, input.body_text, input.button_text, [
+        {
+          title: input.type === "product" ? "Products" : "Services",
+          rows: categories.map((c) => ({ id: `cat_${c.slug}`, title: c.name })),
+        },
+      ]);
       return "Category menu sent to the user.";
+    }
+    case "list_items_in_category": {
+      const items = await listItemsByCategory(input.category_slug);
+      return formatItems(items);
     }
     case "search_catalog": {
       const items = await searchCatalog(input.query, input.type);
@@ -187,6 +228,10 @@ async function executeTool(name: string, input: any, ctx: ToolContext): Promise<
   }
 }
 
+// Pure-navigation tools send a WhatsApp menu whose own body text (written by Claude,
+// in the user's language) already is the reply — no second round-trip, no follow-up text.
+const NAVIGATION_TOOLS = new Set(["show_main_menu", "show_category_menu"]);
+
 export async function getAssistantReply(
   history: ConversationMessage[],
   userMessage: string,
@@ -202,7 +247,7 @@ export async function getAssistantReply(
     const response = await anthropic.messages.create({
       model: "claude-sonnet-5",
       max_tokens: 1024,
-      system: SYSTEM_PROMPT,
+      system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
       tools: TOOLS,
       messages,
     });
@@ -212,14 +257,22 @@ export async function getAssistantReply(
       return textBlock?.type === "text" ? textBlock.text : "";
     }
 
+    const toolUses = response.content.filter((block) => block.type === "tool_use");
+    const allNavigation = toolUses.every((block) => NAVIGATION_TOOLS.has(block.name));
+
+    if (allNavigation && toolUses.length > 0) {
+      for (const block of toolUses) {
+        await executeTool(block.name, block.input, ctx);
+      }
+      return "";
+    }
+
     messages.push({ role: "assistant", content: response.content });
 
     const toolResults: Anthropic.ToolResultBlockParam[] = [];
-    for (const block of response.content) {
-      if (block.type === "tool_use") {
-        const result = await executeTool(block.name, block.input, ctx);
-        toolResults.push({ type: "tool_result", tool_use_id: block.id, content: result });
-      }
+    for (const block of toolUses) {
+      const result = await executeTool(block.name, block.input, ctx);
+      toolResults.push({ type: "tool_result", tool_use_id: block.id, content: result });
     }
     messages.push({ role: "user", content: toolResults });
   }
