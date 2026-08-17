@@ -57,13 +57,18 @@ export interface ChatTurn {
   role: "user" | "assistant";
   content: string;
   at: string; // ISO 8601
+  /** "human" marks a reply a person sent from the portal, so the transcript can
+   *  attribute it to them instead of the bot. Absent means the bot wrote it. */
+  via?: "human";
 }
 
 /** Append turns to the contact's thread. Throws — use logChatTurns for the hot path. */
 export async function ingestChatTurns(
   phoneNumber: string,
   turns: ChatTurn[],
-  contactName?: string | null
+  contactName?: string | null,
+  /** Hours to hold the bot back for this contact — set when a human replies. */
+  pauseBotHours?: number
 ): Promise<number | null> {
   if (turns.length === 0) return null;
 
@@ -76,10 +81,35 @@ export async function ingestChatTurns(
     p_contact_name: contactName ?? null,
     p_contact_phone: phoneNumber,
     p_automation_id: chatAutomationId(),
+    p_pause_bot_hours: pauseBotHours ?? null,
   });
 
   if (error) throw new Error(`chat_ingest_turns: ${error.message}`);
   return data as number | null;
+}
+
+/**
+ * Whether a person is currently handling this contact, in which case the bot
+ * records the inbound message but must not answer it — otherwise the contact
+ * gets two replies that can contradict each other.
+ *
+ * Fails open: if the check itself errors the bot answers as normal, because a
+ * silent bot is a worse failure than an occasional double reply.
+ */
+export async function isBotPaused(phoneNumber: string): Promise<boolean> {
+  try {
+    const supabase = getErpClient();
+    const { data, error } = await supabase.rpc("chat_bot_paused", {
+      p_client_id: chatClientId(),
+      p_channel: CHANNEL,
+      p_external_id: phoneNumber,
+    });
+    if (error) throw new Error(error.message);
+    return data === true;
+  } catch (err) {
+    console.error("[arkflow-chat] pause check failed, answering anyway:", err);
+    return false;
+  }
 }
 
 /** Fire-and-report version for the message handler: a telemetry failure must

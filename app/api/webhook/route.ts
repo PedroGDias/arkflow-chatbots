@@ -10,7 +10,7 @@ import { appendMessage, getConversationHistory } from "@/lib/supabase";
 import { getAssistantReply } from "@/lib/claude";
 import { transcribeAudio } from "@/lib/transcribe";
 import { findOrCreateCustomer, logRun } from "@/lib/erp";
-import { logChatTurns, turnKey } from "@/lib/arkflow-chat";
+import { isBotPaused, logChatTurns, turnKey } from "@/lib/arkflow-chat";
 
 // A reply costs a Claude turn plus tool calls — measured at ~15s on real
 // traffic. The platform default is well under that on some plans, and a killed
@@ -89,6 +89,20 @@ async function handleIncomingMessage(message: IncomingMessage): Promise<void> {
   } else {
     text = message.text;
     respondingTo = message.text;
+  }
+
+  // A person replying from the portal takes the thread over for a while. Record
+  // what the contact said so the transcript and Claude's context stay complete,
+  // but don't answer — two replies to one message contradict each other, and the
+  // human is mid-conversation.
+  if (await isBotPaused(from)) {
+    const messageId = await appendMessage(from, { role: "user", content: text });
+    await logChatTurns(from, [
+      { key: turnKey(messageId), role: "user", content: text, at: new Date().toISOString() },
+    ]);
+    // No logRun: the automation deliberately handled nothing here.
+    console.log(`[webhook] ${from} is human-handled — recorded without replying`);
+    return;
   }
 
   // Run status reflects whether we produced a reply — not whether the outbound
