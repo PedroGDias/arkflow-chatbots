@@ -32,16 +32,22 @@ export async function getConversationHistory(
   return (data ?? []).reverse();
 }
 
+/** Returns the stored row id, which the Arkflow chat mirror uses as its turn key. */
 export async function appendMessage(
   phoneNumber: string,
   message: ConversationMessage
-): Promise<void> {
+): Promise<number> {
   const supabase = getSupabaseClient();
-  const { error } = await supabase.from("messages").insert({
-    phone_number: phoneNumber,
-    role: message.role,
-    content: message.content,
-  });
+  const { data, error } = await supabase
+    .from("messages")
+    .insert({
+      phone_number: phoneNumber,
+      role: message.role,
+      content: message.content,
+    })
+    .select("id")
+    .single();
 
   if (error) throw error;
+  return data.id as number;
 }

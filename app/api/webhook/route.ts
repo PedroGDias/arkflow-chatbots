@@ -10,6 +10,7 @@ import { appendMessage, getConversationHistory } from "@/lib/supabase";
 import { getAssistantReply } from "@/lib/claude";
 import { transcribeAudio } from "@/lib/transcribe";
 import { findOrCreateCustomer, logRun } from "@/lib/erp";
+import { logChatTurns, turnKey } from "@/lib/arkflow-chat";
 
 // Meta calls this once when you register/verify the webhook URL.
 export async function GET(request: NextRequest) {
@@ -99,10 +100,21 @@ async function handleIncomingMessage(message: IncomingMessage): Promise<void> {
   }
 
   const elapsedSec = (Date.now() - startedAt) / 1000;
-  const writes: Promise<unknown>[] = [
+  const assistantContent = reply || "[menu shown to user]";
+
+  // Stored first, because the row ids become the mirror's de-duplication keys.
+  const [userMsgId, assistantMsgId] = await Promise.all([
     appendMessage(from, { role: "user", content: text }),
-    appendMessage(from, { role: "assistant", content: reply || "[menu shown to user]" }),
+    appendMessage(from, { role: "assistant", content: assistantContent }),
+  ]);
+
+  const writes: Promise<unknown>[] = [
     logRun({ customer: from, respondingTo, responseTimeSec: elapsedSec, success: true }),
+    // Distinct timestamps (inbound vs. reply) so the thread reads in order.
+    logChatTurns(from, [
+      { key: turnKey(userMsgId), role: "user", content: text, at: new Date(startedAt).toISOString() },
+      { key: turnKey(assistantMsgId), role: "assistant", content: assistantContent, at: new Date().toISOString() },
+    ]),
   ];
   if (reply) writes.push(sendWhatsAppMessage(from, reply));
 
