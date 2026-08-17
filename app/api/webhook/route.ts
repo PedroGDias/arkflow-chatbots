@@ -12,6 +12,11 @@ import { transcribeAudio } from "@/lib/transcribe";
 import { findOrCreateCustomer, logRun } from "@/lib/erp";
 import { logChatTurns, turnKey } from "@/lib/arkflow-chat";
 
+// A reply costs a Claude turn plus tool calls — measured at ~15s on real
+// traffic. The platform default is well under that on some plans, and a killed
+// function means the user never receives the answer.
+export const maxDuration = 60;
+
 // Meta calls this once when you register/verify the webhook URL.
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
@@ -42,7 +47,13 @@ export async function POST(request: NextRequest) {
 
   for (const message of messages) {
     if (!isAllowedSender(message.from)) continue;
-    await handleIncomingMessage(message);
+    try {
+      await handleIncomingMessage(message);
+    } catch (err) {
+      // Swallow deliberately. A throw here becomes a 5xx, and Meta retries
+      // those — re-running Claude and delivering the user a duplicate reply.
+      console.error("[webhook] handler failed:", err);
+    }
   }
 
   // Always 200 quickly so Meta doesn't retry/disable the webhook.
@@ -102,21 +113,34 @@ async function handleIncomingMessage(message: IncomingMessage): Promise<void> {
   const elapsedSec = (Date.now() - startedAt) / 1000;
   const assistantContent = reply || "[menu shown to user]";
 
-  // Stored first, because the row ids become the mirror's de-duplication keys.
-  const [userMsgId, assistantMsgId] = await Promise.all([
-    appendMessage(from, { role: "user", content: text }),
-    appendMessage(from, { role: "assistant", content: assistantContent }),
-  ]);
+  // Dispatch the reply FIRST. Reaching a reply already costs ~15s of Claude and
+  // tool calls, so anything awaited in front of the send eats into the function's
+  // remaining budget — and if the function is killed at the limit, the user gets
+  // nothing even though the answer was ready.
+  const sending = reply ? sendWhatsAppMessage(from, reply) : Promise.resolve();
 
-  const writes: Promise<unknown>[] = [
-    logRun({ customer: from, respondingTo, responseTimeSec: elapsedSec, success: true }),
+  // History + mirror. The row ids are the mirror's de-duplication keys, so these
+  // stay ordered relative to each other — just no longer ahead of the send.
+  const recording = (async () => {
+    const [userMsgId, assistantMsgId] = await Promise.all([
+      appendMessage(from, { role: "user", content: text }),
+      appendMessage(from, { role: "assistant", content: assistantContent }),
+    ]);
     // Distinct timestamps (inbound vs. reply) so the thread reads in order.
-    logChatTurns(from, [
+    await logChatTurns(from, [
       { key: turnKey(userMsgId), role: "user", content: text, at: new Date(startedAt).toISOString() },
       { key: turnKey(assistantMsgId), role: "assistant", content: assistantContent, at: new Date().toISOString() },
-    ]),
-  ];
-  if (reply) writes.push(sendWhatsAppMessage(from, reply));
+    ]);
+  })().catch((err) => console.error("[webhook] failed to record history:", err));
 
-  await Promise.all(writes);
+  // Bookkeeping must never fail the request: Meta retries a 5xx, which would
+  // re-run Claude and send the user a second reply.
+  const telemetry = logRun({
+    customer: from,
+    respondingTo,
+    responseTimeSec: elapsedSec,
+    success: true,
+  }).catch((err) => console.error("[webhook] failed to log run:", err));
+
+  await Promise.all([sending, recording, telemetry]);
 }
